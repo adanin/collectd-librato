@@ -154,7 +154,7 @@ def get_api_credentials():
             " in API configuration file".format(plugin_name)
         )
         collectd.error(msg)
-        raise Exception(msg)
+        raise ValueError(msg)
 
     if 'api' not in api_creds:
         msg = (
@@ -162,7 +162,7 @@ def get_api_credentials():
             " in API configuration file".format(plugin_name)
         )
         collectd.error(msg)
-        raise Exception(msg)
+        raise ValueError(msg)
 
     if 'host' not in api_creds['api']:
         msg = (
@@ -170,7 +170,7 @@ def get_api_credentials():
             " in API configuration file".format(plugin_name)
         )
         collectd.error(msg)
-        raise Exception(msg)
+        raise ValueError(msg)
 
     config['api_uuid'] = api_creds['uuid']
     config['api_secret'] = api_creds['secret']
@@ -243,11 +243,18 @@ def wallarm_config(cfg_obj):
             plugin_name
         )
         collectd.error(msg)
-        raise Exception(msg)
+        raise ValueError(msg)
     get_api_credentials()
 
     config['http_headers'] = prepare_http_headers()
     config['api_url'] = create_api_url()
+
+    if and(config['use_ssl'], config['ca_verify'], not config['ca_path']):
+        msg = "{0}: No CA certificate provided but it's required".format(
+            plugin_name
+        )
+        collectd.error(msg)
+        raise ValueError(msg)
 
     collectd.debug(
         "{0}: Configured successfully".format(plugin_name)
@@ -294,7 +301,7 @@ def wallarm_flush_metrics(values, data):
         except ValueError:
             index = None
         if index:
-            data['data_lock'] = data['data_lock'][index + 1:]
+            data['values'] = data['values'][index + 1:]
 
 def wallarm_queue_measurements(measurement, data):
     global data, plugin_name
@@ -303,12 +310,12 @@ def wallarm_queue_measurements(measurement, data):
     data['data_lock'].acquire()
 
     queue_length = len(data['values'])
-    extra_values = config['queue_max_length'] - queue_length
+    extra_values = config['main_queue_max_length'] - queue_length
     # If queue is full remove the oldest value.
     if extra_values >= 0:
         data['values'] = data['values'][extra_values + 1:]
-        collectd.error(
-            "{0}: The queue is full. Dropping the oldest value".format(
+        collectd.warning(
+            "{0}: The queue is full. Remove the oldest value".format(
                 plugin_name
             )
         )
@@ -319,8 +326,7 @@ def wallarm_queue_measurements(measurement, data):
     last_flush = curr_time - data['last_flush_time']
 
     # If there is no time to flush just skip it.
-    if last_flush < config['flush_interval_secs'] and \
-           queue_length < config['flush_max_measurements']:
+    if last_flush < config['flush_interval_secs']:
         data['data_lock'].release()
         return
 
@@ -337,8 +343,13 @@ def wallarm_queue_measurements(measurement, data):
         try:
             wallarm_flush_metrics(flush_values, data)
             data['last_flush_time'] = curr_time
-        except urllib2.HTTPError, IOError:
-            pass
+        except urllib2.HTTPError, IOError as e:
+            collectd.warning(
+            "{0}: Cannot send data to API: {1}".format(
+                plugin_name,
+                str(e),
+            )
+        )
         finally:
             data['send_lock'].release()
 
@@ -372,13 +383,17 @@ def wallarm_write(v, data=None):
     wallarm_queue_measurements(measurement, data)
 
 def wallarm_init():
-
+    global config
     try:
         wallarm_parse_types_file(config['types_db'])
-    except:
-        msg = '%s: ERROR: Unable to open TypesDB file: %s.' % \
-              (plugin_name, config['types_db'])
-        raise Exception(msg)
+    except Exception as e:
+        msg = "{0}: ERROR: Unable to open TypesDB file '{1}': {2}.".format(
+            plugin_name,
+            config['types_db'],
+            str(e)
+        )
+        collectd.error(msg)
+        raise e
 
     data = {
         'data_lock': threading.Lock(),
