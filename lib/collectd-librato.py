@@ -265,33 +265,16 @@ def wallarm_flush_metrics(values, data):
     POST a collection of gauges and counters to wallarm.
     """
 
-    headers = {
-        'Content-Type': 'octet/stream',
-        'Authorization': 'Basic %s' % config['auth_header']
-        }
-
-    # body = json.dumps({ 'gauges' : gauges, 'counters' : counters })
-
-    msg = msgpack.packb(values)
-    api_creds = config['api_connection']
-    url = api_creds['api']
-    req = urllib2.Request(url, msg, headers)
-    f = None
-    try:
-        f = data['opener'].open(req, timeout = config['flush_timeout_secs'])
-        response = f.read()
-    except urllib2.HTTPError as error:
-        body = error.read()
-        collectd.warning('%s: Failed to send metrics: Code: %d. Response: %s' % \
-                         (plugin_name, error.code, body))
-        raise error
-    except IOError as error:
-        collectd.warning('%s: Error when sending metrics (%s)' % \
-                         (plugin_name, error.reason))
-        raise error
-    finally:
-        if f:
-            f.close()
+    payload = msgpack.packb(values)
+    req = requests.post(
+        config['api_url'],
+        verify=config['ca_path'],
+        data=payload,
+        headers=config['http_headers'],
+        timeout=config['flush_timeout_secs'],
+    )
+    req.close()
+    eq.raise_for_status()
 
     # Remove sent values from queue
     last_sent_value = values[-1]
@@ -343,7 +326,7 @@ def wallarm_queue_measurements(measurement, data):
         try:
             wallarm_flush_metrics(flush_values, data)
             data['last_flush_time'] = curr_time
-        except urllib2.HTTPError, IOError as e:
+        except requests.exceptions.RequestException as e:
             collectd.warning(
             "{0}: Cannot send data to API: {1}".format(
                 plugin_name,
