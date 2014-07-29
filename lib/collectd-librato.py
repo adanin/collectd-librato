@@ -70,7 +70,8 @@ config = {
     'use_ssl': False,
     'ca_path': None,
     'ca_verify': False,
-    'api_port': 80,
+    'api_port': None,
+    'url_path': '/',
     'types_db': '/usr/share/collectd/types.db',
     'flush_interval_secs': 2,
     'flush_timeout_secs': 10,
@@ -179,6 +180,22 @@ def get_api_credentials():
     config['ca_path'] = api_creds['api']['ca_path']
     config['ca_verify'] = api_creds['api']['ca_verify']
 
+def create_api_url():
+    global config
+    scheme = 'https' if config['use_ssl'] else 'http'
+    netloc = config['api_host']
+    if config['api_port']:
+        netloc = '{}:{}'.format(netloc, config['api_port'])
+
+    return requests.utils.urlunparse(
+        scheme,
+        netloc,
+        config['url_path'],
+        None,
+        None,
+        None
+    )
+
 def build_http_auth():
     global config
     return {
@@ -211,6 +228,8 @@ def wallarm_config(cfg_obj):
             config['flush_interval_secs'] = int(val)
         elif child.key == 'FlushTimeoutSecs':
             config['flush_timeout_secs'] = int(val)
+        elif child.key == 'URLPath':
+            config['url_path'] = val
         else:
             collectd.warning(
                 '{0}: Unknown config key: {1}.'.format(
@@ -228,6 +247,7 @@ def wallarm_config(cfg_obj):
     get_api_credentials()
 
     config['http_headers'] = prepare_http_headers()
+    config['api_url'] = create_api_url()
 
     collectd.debug(
         "{0}: Configured successfully".format(plugin_name)
