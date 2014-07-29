@@ -36,7 +36,7 @@ from copy import copy
 
 # NOTE: This version is grepped from the Makefile, so don't change the
 # format of this line.
-version = "0.0.10"
+version = "0.0.1"
 
 # config = { 'api_path' : '/v1/metrics',
 #            'api' : 'https://metrics-api.wallarm.com',
@@ -50,6 +50,17 @@ version = "0.0.10"
 #            'lower_case' : False,
 #            'single_value_names' : False
 #            }
+
+# Example of API config
+# uuid: <some-uuid-in-hex>
+# secret: <some-hex-sring
+# api:
+#   host: api.wallarm.com
+#   port: 443
+#   use_ssl: true
+#   ca_path: /etc/wallarm/ca.crt
+#   ca_verify: true
+
 plugin_name = 'wallarm-msgpack.py'
 types = {}
 
@@ -57,21 +68,16 @@ conn_obj = None
 # Some default values
 config = {
     'use_ssl': False,
-    'verify_ca': False,
+    'ca_path': None,
+    'ca_verify': False,
+    'api_port': 80,
     'types_db': '/usr/share/collectd/types.db',
-    'flush_interval_secs': 30,
-    'flush_max_measurements': 600,
-    'flush_timeout_secs': 15,
-    'queue_max_length': 20000,
+    'flush_interval_secs': 2,
+    'flush_timeout_secs': 10,
+    'main_queue_max_length': 200000,
+    'send_queue_max_length': 10000,
 }
 
-
-def str_to_num(s):
-    """
-    Convert type limits from strings to floats for arithmetic.
-    """
-
-    return float(s)
 
 def get_time():
     """
@@ -116,42 +122,76 @@ def wallarm_parse_types_file(path):
                 )
             )
 
-def get_credentials(config_file):
+def get_api_credentials():
     """
     Read a settings YAML file with API credentials
-
-    return: a dict with credentials
     """
 
+    global config, plugin_name
     collectd.debug(
-        "{0}: Read config file with connection settings".format(
-            plugin_name
+        "{0}: Read config file with API configuration '{1}'".format(
+            plugin_name,
+            config['api_conn_file'],
         )
     )
     try:
-        with open(config_file) as fo:
+        with open(config['api_conn_file']) as fo:
             api_creds = yaml.load(fo)
     except IOError as e:
         collectd.error(
-            "{0}: Cannot get connection settings from file {1}: {2}".format(
-                plugin_name
-                config_file,
+            "{0}: Cannot get API configuration from file {1}: {2}".format(
+                plugin_name,
+                config['api_conn_file'],
                 str(e)
             )
         )
         raise e
-    return api_creds
+
+    if 'uuid' not in api_creds or 'secret' not in api_creds:
+        msg = (
+            "{0}: There is no 'secret' or 'uuid' fields"
+            " in API configuration file".format(plugin_name)
+        )
+        collectd.error(msg)
+        raise Exception(msg)
+
+    if 'api' not in api_creds:
+        msg = (
+            "{0}: There is no 'api' section"
+            " in API configuration file".format(plugin_name)
+        )
+        collectd.error(msg)
+        raise Exception(msg)
+
+    if 'host' not in api_creds['api']:
+        msg = (
+            "{0}: There is no 'host' field in 'api' section"
+            " in API configuration file".format(plugin_name)
+        )
+        collectd.error(msg)
+        raise Exception(msg)
+
+    config['api_uuid'] = api_creds['uuid']
+    config['api_secret'] = api_creds['secret']
+    config['api_host'] = api_creds['api']['host']
+    config['api_port'] = api_creds['api']['port']
+    config['use_ssl'] = api_creds['api']['use_ssl']
+    config['ca_path'] = api_creds['api']['ca_path']
+    config['ca_verify'] = api_creds['api']['ca_verify']
 
 def build_http_auth():
     global config
-    api_creds = config['api_connection']
-    if 'username' in api_creds and 'password' in api_creds:
-        base64string = base64.encodestring('%s:%s' % \
-                                           (api_creds['username'],
-                                            api_creds['password']))
-        return base64string.translate(None, '\n')
-    else:
-        return None
+    return {
+        'X-Wallarm-Node': config['api_uuid'],
+        'X-Wallarm-Secret': config['api_secret'],
+    }
+
+def prepare_http_headers():
+    headers = {
+        'Content-Type': 'application/msgpack',
+    }
+    headers.update(build_http_auth())
+    return headers
 
 def wallarm_config(cfg_obj):
     global config
@@ -160,20 +200,17 @@ def wallarm_config(cfg_obj):
         val = child.values[0]
 
         if child.key  == 'APIConnFile':
-            config['api_connection'] = get_api_credentials(c.values[0])
+            config['api_conn_file'] = val
         elif child.key == 'TypesDB':
             config['types_db'] = val
-        elif child.key == 'QueueMaxLength':
-            config['queue_max_length'] = int(val)
-        elif child.key == 'FloorTimeSecs':
-            config['floor_time_secs'] = int(val)
+        elif child.key == 'MainQueueMaxLength':
+            config['main_queue_max_length'] = int(val)
+        elif child.key == 'SendQueueMaxLength':
+            config['send_queue_max_length'] = int(val)
         elif child.key == 'FlushIntervalSecs':
-            try:
-                config['flush_interval_secs'] = int(str_to_num(val))
-            except:
-                msg = '%s: Invalid value for FlushIntervalSecs: %s' % \
-                          (plugin_name, val)
-                raise Exception(msg)
+            config['flush_interval_secs'] = int(val)
+        elif child.key == 'FlushTimeoutSecs':
+            config['flush_timeout_secs'] = int(val)
         else:
             collectd.warning(
                 '{0}: Unknown config key: {1}.'.format(
@@ -181,14 +218,20 @@ def wallarm_config(cfg_obj):
                     child.key
                 )
             )
-        collectd.debug(
-            "{0}: Configured successfully".format(plugin_name)
-        ) 
 
-    if not config['api_connection'].has_key('api_url'):
-        raise Exception('API URL is not defined')
+    if 'api_conn_file' not in config:
+        msg = '{0}: No file with API configuration provided'.format(
+            plugin_name
+        )
+        collectd.error(msg)
+        raise Exception(msg)
+    get_api_credentials()
 
-    config['auth_header'] = build_http_auth()
+    config['http_headers'] = prepare_http_headers()
+
+    collectd.debug(
+        "{0}: Configured successfully".format(plugin_name)
+    )
 
 def create_opener():
     api_creds = config['api_connection']
