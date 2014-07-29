@@ -87,10 +87,12 @@ def get_time():
 
     return int(time.mktime(time.localtime()))
 
-#
-# Parse the types.db(5) file to determine metric types.
-#
+
 def wallarm_parse_types_file(path):
+    """
+    Parse the types.db(5) file to determine metric types.
+    """
+
     global types
 
     with open(path, 'r') as f:
@@ -110,9 +112,13 @@ def wallarm_parse_types_file(path):
                 ds_fields = ds.split(':')
 
                 if len(ds_fields) != 4:
-                    collectd.warning('%s: cannot parse data source ' \
-                                     '%s on type %s' %
-                                     (plugin_name, ds, type_name))
+                    collectd.warning(
+                        '{0}: cannot parse data source {1} on type {2}'.format(
+                            plugin_name,
+                            ds,
+                            type_name
+                        )
+                    )
                     continue
 
                 v.append(ds_fields)
@@ -122,6 +128,7 @@ def wallarm_parse_types_file(path):
                     lambda n: n[:2], v
                 )
             )
+
 
 def get_api_credentials():
     """
@@ -180,6 +187,7 @@ def get_api_credentials():
     config['ca_path'] = api_creds['api']['ca_path']
     config['ca_verify'] = api_creds['api']['ca_verify']
 
+
 def create_api_url():
     global config
     scheme = 'https' if config['use_ssl'] else 'http'
@@ -196,12 +204,14 @@ def create_api_url():
         None
     )
 
+
 def build_http_auth():
     global config
     return {
         'X-Wallarm-Node': config['api_uuid'],
         'X-Wallarm-Secret': config['api_secret'],
     }
+
 
 def prepare_http_headers():
     headers = {
@@ -210,13 +220,14 @@ def prepare_http_headers():
     headers.update(build_http_auth())
     return headers
 
+
 def wallarm_config(cfg_obj):
     global config
 
     for child in cfg_obj.children:
         val = child.values[0]
 
-        if child.key  == 'APIConnFile':
+        if child.key == 'APIConnFile':
             config['api_conn_file'] = val
         elif child.key == 'TypesDB':
             config['types_db'] = val
@@ -260,6 +271,7 @@ def wallarm_config(cfg_obj):
         "{0}: Configured successfully".format(plugin_name)
     )
 
+
 def wallarm_flush_metrics(values, data):
     """
     POST a collection of gauges and counters to wallarm.
@@ -285,6 +297,7 @@ def wallarm_flush_metrics(values, data):
             index = None
         if index:
             data['values'] = data['values'][index + 1:]
+
 
 def wallarm_queue_measurements(measurement, data):
     global data, plugin_name
@@ -321,35 +334,44 @@ def wallarm_queue_measurements(measurement, data):
         data['send_lock'].acquire()
         send_data = True
     data['data_lock'].release()
-    
+
     if send_data:
         try:
             wallarm_flush_metrics(flush_values, data)
             data['last_flush_time'] = curr_time
         except requests.exceptions.RequestException as e:
             collectd.warning(
-            "{0}: Cannot send data to API: {1}".format(
-                plugin_name,
-                str(e),
+                "{0}: Cannot send data to API: {1}".format(
+                    plugin_name,
+                    str(e),
+                )
             )
-        )
         finally:
             data['send_lock'].release()
+
 
 def wallarm_write(v, data=None):
     global plugin_name, types, config
 
     if v.type not in types:
-        collectd.warning('%s: do not know how to handle type %s. ' \
-                         'do you have all your types.db files configured?' % \
-                         (plugin_name, v.type))
+        collectd.warning(
+            '{0}: do not know how to handle type {1}. Do you have'
+            ' all your types.db files configured?'.format(
+                plugin_name,
+                v.type,
+            )
+        )
         return
 
     v_type = types[v.type]
 
     if len(v_type[0]) != len(v.values):
-        collectd.warning('%s: differing number of values for type %s' % \
-                         (plugin_name, v.type))
+        collectd.warning(
+            '{0}: differing number of values for type {1}'.format(
+                plugin_name,
+                v.type,
+            )
+        )
         return
 
     measurement = {
@@ -364,6 +386,7 @@ def wallarm_write(v, data=None):
         "type_instance": v.type_instance
     }
     wallarm_queue_measurements(measurement, data)
+
 
 def wallarm_init():
     global config
@@ -385,7 +408,8 @@ def wallarm_init():
         'values': [],
         }
 
-    collectd.register_write(wallarm_write, data = data)
+    collectd.register_write(wallarm_write, data=data)
+
 
 collectd.register_config(wallarm_config)
 collectd.register_init(wallarm_init)
