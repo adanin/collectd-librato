@@ -253,45 +253,6 @@ def wallarm_config(cfg_obj):
         "{0}: Configured successfully".format(plugin_name)
     )
 
-def create_opener():
-    api_creds = config['api_connection']
-    if api_creds.get('verify_ca'):
-        ca_reqs = ssl.CERT_REQUIRED
-    else:
-        ca_reqs = ssl.CERT_NONE
-
-    class ValidHTTPSConnection(httplib.HTTPConnection):
-            "This class allows communication via SSL."
-
-            default_port = httplib.HTTPS_PORT
-
-            def __init__(self, *args, **kwargs):
-                httplib.HTTPConnection.__init__(self, *args, **kwargs)
-
-            def connect(self):
-                "Connect to a host on a given (SSL) port."
-
-                sock = socket.create_connection(
-                    (self.host, self.port),
-                    self.timeout,
-                    self.source_address
-                )
-                if self._tunnel_host:
-                    self.sock = sock
-                    self._tunnel()
-                self.sock = ssl.wrap_socket(
-                    sock,
-                    ca_certs=api_creds.get('ca_path', None),
-                    cert_reqs=ca_reqs
-                )
-
-    class ValidHTTPSHandler(urllib2.HTTPSHandler):
-
-        def https_open(self, req):
-                return self.do_open(ValidHTTPSConnection, req)
-
-    return urllib2.build_opener(ValidHTTPSHandler)
-
 def wallarm_flush_metrics(values, data):
     """
     POST a collection of gauges and counters to wallarm.
@@ -424,7 +385,6 @@ def wallarm_init():
         'send_lock': threading.Lock(),
         'last_flush_time': get_time(),
         'values': [],
-        'opener': create_opener(),
         }
 
     collectd.register_write(wallarm_write, data = data)
