@@ -30,16 +30,6 @@ import yaml
 # format of this line.
 version = "0.0.1"
 
-# Example of API config
-# uuid: <some-uuid-in-hex>
-# secret: <some-hex-sring
-# api:
-#   host: api.wallarm.com
-#   port: 443
-#   use_ssl: true
-#   ca_path: /etc/wallarm/ca.crt
-#   ca_verify: true
-
 plugin_name = 'wallarm_msgpack.py'
 types = {}
 
