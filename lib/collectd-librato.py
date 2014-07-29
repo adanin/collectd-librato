@@ -16,23 +16,15 @@
 # limitations under the License.
 #
 
-import base64
 import collectd
-import httplib
-import math
 import msgpack
 import os
-import re
-import socket
-import ssl
+import requests
 import sys
 import time
 import threading
-import urllib2
 import yaml
 
-from string import maketrans
-from copy import copy
 
 # NOTE: This version is grepped from the Makefile, so don't change the
 # format of this line.
