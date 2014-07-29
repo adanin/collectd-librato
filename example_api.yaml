@@ -1,0 +1,8 @@
+uuid: some-uuid-in-hex
+secret: some-hex-sring
+api:
+  host: api.wallarm.com
+  port: 443
+  use_ssl: true
+#  ca_path: /etc/wallarm/ca.crt
+#  ca_verify: true
