@@ -30,19 +30,6 @@ import yaml
 # format of this line.
 version = "0.0.1"
 
-# config = { 'api_path' : '/v1/metrics',
-#            'api' : 'https://metrics-api.wallarm.com',
-#            'types_db' : '/usr/share/collectd/types.db',
-#            'metric_prefix' : 'collectd',
-#            'metric_separator' : '.',
-#            'source' : None,
-#            'flush_interval_secs' : 30,
-#            'flush_max_measurements' : 600,
-#            'flush_timeout_secs' : 15,
-#            'lower_case' : False,
-#            'single_value_names' : False
-#            }
-
 # Example of API config
 # uuid: <some-uuid-in-hex>
 # secret: <some-hex-sring
@@ -53,7 +40,7 @@ version = "0.0.1"
 #   ca_path: /etc/wallarm/ca.crt
 #   ca_verify: true
 
-plugin_name = 'wallarm-msgpack.py'
+plugin_name = 'wallarm_msgpack.py'
 types = {}
 
 conn_obj = None
@@ -174,10 +161,10 @@ def get_api_credentials():
     config['api_uuid'] = api_creds['uuid']
     config['api_secret'] = api_creds['secret']
     config['api_host'] = api_creds['api']['host']
-    config['api_port'] = api_creds['api']['port']
-    config['use_ssl'] = api_creds['api']['use_ssl']
-    config['ca_path'] = api_creds['api']['ca_path']
-    config['ca_verify'] = api_creds['api']['ca_verify']
+    config['api_port'] = api_creds['api'].get('port')
+    config['use_ssl'] = api_creds['api'].get('use_ssl')
+    config['ca_path'] = api_creds['api'].get('ca_path')
+    config['ca_verify'] = api_creds['api'].get('ca_verify')
 
 
 def create_api_url():
@@ -187,14 +174,14 @@ def create_api_url():
     if config['api_port']:
         netloc = '{}:{}'.format(netloc, config['api_port'])
 
-    return requests.utils.urlunparse(
+    return requests.utils.urlunparse((
         scheme,
         netloc,
         config['url_path'],
         None,
         None,
         None
-    )
+    ))
 
 
 def build_http_auth():
@@ -213,7 +200,7 @@ def prepare_http_headers():
     return headers
 
 
-def wallarm_config(cfg_obj):
+def wallarm_msgpack(cfg_obj):
     global config
 
     for child in cfg_obj.children:
@@ -252,7 +239,7 @@ def wallarm_config(cfg_obj):
     config['http_headers'] = prepare_http_headers()
     config['api_url'] = create_api_url()
 
-    if and(config['use_ssl'], config['ca_verify'], not config['ca_path']):
+    if config['use_ssl'] and config['ca_verify'] and not config['ca_path']:
         msg = "{0}: No CA certificate provided but it's required".format(
             plugin_name
         )
@@ -278,7 +265,7 @@ def wallarm_flush_metrics(values, data):
         timeout=config['flush_timeout_secs'],
     )
     req.close()
-    eq.raise_for_status()
+    req.raise_for_status()
 
     # Remove sent values from queue
     last_sent_value = values[-1]
@@ -292,21 +279,21 @@ def wallarm_flush_metrics(values, data):
 
 
 def wallarm_queue_measurements(measurement, data):
-    global data, plugin_name
+    global config, plugin_name
     # Updating shared data structures
     #
     data['data_lock'].acquire()
 
     queue_length = len(data['values'])
-    extra_values = config['main_queue_max_length'] - queue_length
+    extra_values = queue_length - config['main_queue_max_length']
     # If queue is full remove the oldest value.
     if extra_values >= 0:
-        data['values'] = data['values'][extra_values + 1:]
         collectd.warning(
             "{0}: The queue is full. Remove the oldest value".format(
                 plugin_name
             )
         )
+        data['values'] = data['values'][extra_values + 1:]
 
     data['values'].append(measurement)
 
@@ -320,10 +307,10 @@ def wallarm_queue_measurements(measurement, data):
 
     # Do nothing if another thread is sending data now.
     if data['send_lock'].locked():
-        flush_values = data['values']
         send_data = False
     else:
         data['send_lock'].acquire()
+        flush_values = data['values']
         send_data = True
     data['data_lock'].release()
 
@@ -403,5 +390,5 @@ def wallarm_init():
     collectd.register_write(wallarm_write, data=data)
 
 
-collectd.register_config(wallarm_config)
+collectd.register_config(wallarm_msgpack)
 collectd.register_init(wallarm_init)
