@@ -30,24 +30,31 @@ import yaml
 # format of this line.
 version = "0.0.1"
 
-plugin_name = 'wallarm_msgpack.py'
+plugin_name = 'wallarm_api_writer'
 types = {}
 
 conn_obj = None
 # Some default values
 config = {
-    'use_ssl': False,
-    'ca_path': None,
-    'ca_verify': False,
-    'api_port': None,
     'url_path': '/',
-    'types_db': '/usr/share/collectd/types.db',
+    'types_db': ['/usr/share/collectd/types.db'],
     'flush_interval_secs': 2,
-    'flush_timeout_secs': 10,
+    'send_timeout_secs': 10,
     'main_queue_max_length': 200000,
     'send_queue_max_length': 10000,
+    'api': {
+        'host': 'localhost',
+        # 'port' depends on 'use_ssl' value
+        'ca_path': '/dev/null',
+        'ca_verify': False,
+        'use_ssl': False,
+    },
 }
 
+default_ports = {
+    'http': 80,
+    'https': 444,
+}
 
 def get_time():
     """
@@ -132,37 +139,22 @@ def get_api_credentials():
         collectd.error(msg)
         raise ValueError(msg)
 
+    for key in 'uuid', 'secret':
+        config['api'][key] = api_creds[key]
+
     if 'api' not in api_creds:
-        msg = (
-            "{0}: There is no 'api' section"
-            " in API configuration file".format(plugin_name)
-        )
-        collectd.error(msg)
-        raise ValueError(msg)
+        return
 
-    if 'host' not in api_creds['api']:
-        msg = (
-            "{0}: There is no 'host' field in 'api' section"
-            " in API configuration file".format(plugin_name)
-        )
-        collectd.error(msg)
-        raise ValueError(msg)
-
-    config['api_uuid'] = api_creds['uuid']
-    config['api_secret'] = api_creds['secret']
-    config['api_host'] = api_creds['api']['host']
-    config['api_port'] = api_creds['api'].get('port')
-    config['use_ssl'] = api_creds['api'].get('use_ssl')
-    config['ca_path'] = api_creds['api'].get('ca_path')
-    config['ca_verify'] = api_creds['api'].get('ca_verify')
+    for key in 'host', 'port', 'use_ssl', 'ca_path', 'ca_verify':
+        if key in api_creds['api']:
+            config['api'][key] = api_creds['api'][key]
 
 
 def create_api_url():
     global config
-    scheme = 'https' if config['use_ssl'] else 'http'
-    netloc = config['api_host']
-    if config['api_port']:
-        netloc = '{}:{}'.format(netloc, config['api_port'])
+    scheme = 'https' if config['api']['use_ssl'] else 'http'
+    port = config['api'].get('port', default_ports[scheme])
+    netloc = '{}:{}'.format(config['api']['host'], port)
 
     return requests.utils.urlunparse((
         scheme,
@@ -174,11 +166,11 @@ def create_api_url():
     ))
 
 
-def build_http_auth():
+def build_http_auth(my_config):
     global config
     return {
-        'X-Wallarm-Node': config['api_uuid'],
-        'X-Wallarm-Secret': config['api_secret'],
+        'X-Wallarm-Node': config['api']['uuid'],
+        'X-Wallarm-Secret': config['api']['secret'],
     }
 
 
@@ -207,7 +199,7 @@ def wallarm_msgpack(cfg_obj):
         elif child.key == 'FlushIntervalSecs':
             config['flush_interval_secs'] = int(val)
         elif child.key == 'FlushTimeoutSecs':
-            config['flush_timeout_secs'] = int(val)
+            config['send_timeout_secs'] = int(val)
         elif child.key == 'URLPath':
             config['url_path'] = val
         else:
@@ -229,7 +221,8 @@ def wallarm_msgpack(cfg_obj):
     config['http_headers'] = prepare_http_headers()
     config['api_url'] = create_api_url()
 
-    if config['use_ssl'] and config['ca_verify'] and not config['ca_path']:
+    if (config['api']['use_ssl'] and config['api']['ca_verify']
+            and not config['api']['ca_path']):
         msg = "{0}: No CA certificate provided but it's required".format(
             plugin_name
         )
@@ -359,16 +352,24 @@ def wallarm_write(v, data=None):
 
 def wallarm_init():
     global config
-    try:
-        wallarm_parse_types_file(config['types_db'])
-    except Exception as e:
-        msg = "{0}: ERROR: Unable to open TypesDB file '{1}': {2}.".format(
+    for typedb_file in config['types_db']:
+        try:
+            wallarm_parse_types_file(typedb_file)
+        except IOError as e:
+            msg = "{0}: Unable to open TypesDB file '{1}': {2}.".format(
+                plugin_name,
+                typedb_file,
+                str(e)
+            )
+            collectd.warning(msg)
+
+    if not len(types):
+        msg = "{0}: Didn't find any valid type in TypesDB files: {1}".format(
             plugin_name,
             config['types_db'],
-            str(e)
         )
         collectd.error(msg)
-        raise e
+        raise ValueError(msg)
 
     data = {
         'data_lock': threading.Lock(),
