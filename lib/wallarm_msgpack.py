@@ -19,8 +19,8 @@
 import collectd
 import msgpack
 import os
+import Queue
 import requests
-import sys
 import time
 import threading
 import yaml
@@ -28,12 +28,11 @@ import yaml
 
 # NOTE: This version is grepped from the Makefile, so don't change the
 # format of this line.
-version = "0.0.1"
+version = "0.0.2"
 
 plugin_name = 'wallarm_api_writer'
 types = {}
 
-conn_obj = None
 # Some default values
 config = {
     'url_path': '/',
@@ -49,12 +48,12 @@ config = {
         'ca_verify': False,
         'use_ssl': False,
     },
+    'default_ports': {
+        'http': 80,
+        'https': 444,
+    },
 }
 
-default_ports = {
-    'http': 80,
-    'https': 444,
-}
 
 def get_time():
     """
@@ -106,26 +105,20 @@ def wallarm_parse_types_file(path):
             )
 
 
-def get_api_credentials():
+def get_api_credentials(myconfig):
     """
     Read a settings YAML file with API credentials
     """
 
-    global config, plugin_name
-    collectd.debug(
-        "{0}: Read config file with API configuration '{1}'".format(
-            plugin_name,
-            config['api_conn_file'],
-        )
-    )
+    global plugin_name
     try:
-        with open(config['api_conn_file']) as fo:
+        with open(myconfig['api_conn_file']) as fo:
             api_creds = yaml.load(fo)
     except IOError as e:
         collectd.error(
             "{0}: Cannot get API configuration from file {1}: {2}".format(
                 plugin_name,
-                config['api_conn_file'],
+                myconfig['api_conn_file'],
                 str(e)
             )
         )
@@ -140,46 +133,65 @@ def get_api_credentials():
         raise ValueError(msg)
 
     for key in 'uuid', 'secret':
-        config['api'][key] = api_creds[key]
+        myconfig['api'][key] = api_creds[key]
 
     if 'api' not in api_creds:
         return
 
     for key in 'host', 'port', 'use_ssl', 'ca_path', 'ca_verify':
         if key in api_creds['api']:
-            config['api'][key] = api_creds['api'][key]
+            myconfig['api'][key] = api_creds['api'][key]
 
 
-def create_api_url():
-    global config
-    scheme = 'https' if config['api']['use_ssl'] else 'http'
-    port = config['api'].get('port', default_ports[scheme])
-    netloc = '{}:{}'.format(config['api']['host'], port)
+def create_api_url(myconfig):
+    scheme = 'https' if myconfig['api']['use_ssl'] else 'http'
+    port = myconfig['api'].get(
+        'port',
+        myconfig['default_ports'][scheme]
+    )
+    netloc = '{}:{}'.format(myconfig['api']['host'], port)
 
     return requests.utils.urlunparse((
         scheme,
         netloc,
-        config['url_path'],
+        myconfig['url_path'],
         None,
         None,
         None
     ))
 
 
-def build_http_auth(my_config):
-    global config
+def build_http_auth(myconfig):
     return {
-        'X-Wallarm-Node': config['api']['uuid'],
-        'X-Wallarm-Secret': config['api']['secret'],
+        'X-Wallarm-Node': myconfig['api'].get('uuid', ''),
+        'X-Wallarm-Secret': myconfig['api'].get('secret', ''),
     }
 
 
-def prepare_http_headers():
+def prepare_http_headers(myconfig):
     headers = {
         'Content-Type': 'application/msgpack',
     }
-    headers.update(build_http_auth())
+    headers.update(build_http_auth(myconfig))
     return headers
+
+
+def is_new_credentials(myconfig):
+    try:
+        cur_api_file_mtime = os.stat(myconfig['api_conn_file']).st_mtime
+        if cur_api_file_mtime != myconfig.get('api_file_mtime', 0):
+            myconfig['api_file_mtime'] = cur_api_file_mtime
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def update_credentials(myconfig):
+    if is_new_credentials(myconfig):
+        get_api_credentials(myconfig)
+        myconfig['http_headers'] = prepare_http_headers(myconfig)
+        myconfig['api_url'] = create_api_url(myconfig)
 
 
 def wallarm_msgpack(cfg_obj):
@@ -211,105 +223,111 @@ def wallarm_msgpack(cfg_obj):
             )
 
     if 'api_conn_file' not in config:
-        msg = '{0}: No file with API configuration provided'.format(
-            plugin_name
-        )
-        collectd.error(msg)
-        raise ValueError(msg)
-    get_api_credentials()
-
-    config['http_headers'] = prepare_http_headers()
-    config['api_url'] = create_api_url()
-
-    if (config['api']['use_ssl'] and config['api']['ca_verify']
-            and not config['api']['ca_path']):
-        msg = "{0}: No CA certificate provided but it's required".format(
+        msg = '{0}: No file with an API configuration provided'.format(
             plugin_name
         )
         collectd.error(msg)
         raise ValueError(msg)
 
-    collectd.debug(
-        "{0}: Configured successfully".format(plugin_name)
-    )
+    update_credentials(config)
 
 
-def wallarm_flush_metrics(values, data):
+def send_data(myconfig, payload):
     """
-    POST a collection of gauges and counters to wallarm.
+    POST a collection of metrics to the API.
     """
 
-    payload = msgpack.packb(values)
-    req = requests.post(
-        config['api_url'],
-        verify=config['ca_path'],
-        data=payload,
-        headers=config['http_headers'],
-        timeout=config['flush_timeout_secs'],
-    )
-    req.close()
-    req.raise_for_status()
+    global plugin_name
+    update_credentials(myconfig)
 
-    # Remove sent values from queue
-    last_sent_value = values[-1]
-    with data['data_lock']:
-        try:
-            index = data['values'].index(last_sent_value)
-        except ValueError:
-            index = None
-        if index:
-            data['values'] = data['values'][index + 1:]
-
-
-def wallarm_queue_measurements(measurement, data):
-    global config, plugin_name
-    # Updating shared data structures
-    #
-    data['data_lock'].acquire()
-
-    queue_length = len(data['values'])
-    extra_values = queue_length - config['main_queue_max_length']
-    # If queue is full remove the oldest value.
-    if extra_values >= 0:
-        collectd.warning(
-            "{0}: The queue is full. Remove the oldest value".format(
-                plugin_name
-            )
-        )
-        data['values'] = data['values'][extra_values + 1:]
-
-    data['values'].append(measurement)
-
-    curr_time = get_time()
-    last_flush = curr_time - data['last_flush_time']
-
-    # If there is no time to flush just skip it.
-    if last_flush < config['flush_interval_secs']:
-        data['data_lock'].release()
-        return
-
-    # Do nothing if another thread is sending data now.
-    if data['send_lock'].locked():
-        send_data = False
+    if (myconfig['api']['use_ssl'] and myconfig['api']['ca_verify']
+            and myconfig['api']['ca_path']):
+        verify = myconfig['api']['ca_path']
     else:
-        data['send_lock'].acquire()
-        flush_values = data['values']
-        send_data = True
-    data['data_lock'].release()
+        verify = None
 
-    if send_data:
-        try:
-            wallarm_flush_metrics(flush_values, data)
-            data['last_flush_time'] = curr_time
-        except requests.exceptions.RequestException as e:
-            collectd.warning(
-                "{0}: Cannot send data to API: {1}".format(
-                    plugin_name,
-                    str(e),
-                )
+    try:
+        req = requests.post(
+            myconfig['api_url'],
+            verify=verify,
+            data=payload,
+            headers=config['http_headers'],
+            timeout=config['send_timeout_secs'],
+        )
+        req.close()
+        req.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        collectd.warning(
+            "{0}: Cannot send data to the API: {1}".format(
+                plugin_name,
+                str(e),
             )
-        finally:
-            data['send_lock'].release()
+        )
+        return False
+    return True
+
+
+def update_queue_size(myconfig):
+    size = myconfig['max_msg_size_bytes'] / myconfig['measr_avg_size']
+    myconfig['send_queue_size'] = myconfig['msg_size_dec_coeff'] * size
+
+
+def pack_msg(myconfig, send_queue):
+    msg = msgpack.packb(send_queue)
+    while len(msg) > config['max_msg_size_bytes']:
+        config['measr_avg_size'] = len(msg) / len(send_queue)
+        update_queue_size(myconfig)
+        msg = msgpack.packb(
+            send_queue[:config['send_queue_size']]
+        )
+    send_queue = send_queue[config['send_queue_size']:]
+    return msg
+
+
+def send_loop(myconfig, mydata):
+    # config = {
+    #     'measr_avg_size': 200,
+    #     'send_timeout_secs': 10,
+    #     'flush_interval_secs': 2,
+    #     'max_msg_size_bytes': 1000*1000,
+    #     'max_measr_keep_interval_secs': 1800,
+    #     'msg_size_dec_coeff': 0.98,
+    # }
+    # data = {
+    #     'values': Queue.Queue(),
+    # }
+
+    update_queue_size(myconfig)
+    main_queue = mydata['values']
+    send_queue = []
+    packed_data = None
+    empty_main_queue = False
+    is_retry = False
+    mydata['last_flush_time'] = get_time()
+
+    while True:
+        time.sleep(myconfig['flush_interval_secs'])
+
+        if is_retry:
+            if not send_data(myconfig, packed_data):
+                continue
+            is_retry = False
+
+        while not (empty_main_queue and len(send_queue)) or not is_retry:
+            # Fill up internal send_queue.
+            try:
+                for i in xrange(myconfig['send_queue_size'] - len(send_queue)):
+                    send_queue.append(main_queue.get_nowait())
+                    main_queue.task_done()
+            except Queue.Empty:
+                empty_main_queue = True
+
+            # Pack send_queue but try to fit into max message size.
+            packed_data = pack_msg(myconfig, send_queue)
+            if not send_data(myconfig, packed_data):
+                is_retry = True
+                continue
+            mydata['last_flush_time'] = get_time()
 
 
 def wallarm_write(v, data=None):
@@ -347,7 +365,7 @@ def wallarm_write(v, data=None):
         "type": v.type,
         "type_instance": v.type_instance
     }
-    wallarm_queue_measurements(measurement, data)
+    data['values'].put(measurement)
 
 
 def wallarm_init():
@@ -372,12 +390,13 @@ def wallarm_init():
         raise ValueError(msg)
 
     data = {
-        'data_lock': threading.Lock(),
-        'send_lock': threading.Lock(),
         'last_flush_time': get_time(),
-        'values': [],
+        'values': Queue.Queue(),
         }
 
+    send_thread = threading.Thread(target=send_loop, args=[config, data])
+    data['sender'] = send_thread
+    send_thread.start()
     collectd.register_write(wallarm_write, data=data)
 
 
