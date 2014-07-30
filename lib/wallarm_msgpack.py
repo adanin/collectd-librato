@@ -23,6 +23,7 @@ import Queue
 import requests
 import time
 import threading
+import urlparse
 import yaml
 
 
@@ -151,7 +152,7 @@ def create_api_url(myconfig):
     )
     netloc = '{}:{}'.format(myconfig['api']['host'], port)
 
-    return requests.utils.urlunparse((
+    return urlparse.urlunparse((
         scheme,
         netloc,
         myconfig['url_path'],
@@ -330,6 +331,20 @@ def send_loop(myconfig, mydata):
             mydata['last_flush_time'] = get_time()
 
 
+def send_watchdog(myconfig, mydata):
+    while True
+        try:
+            send_loop(myconfig, mydata)
+        except KeyboardInterrupt:
+            return
+        except Exception as e:
+            msg = "{0}: Sender failed and will be restarted: {1}".format(
+                plugin_name,
+                str(e)
+            )
+            collectd.error(msg)
+
+
 def wallarm_write(v, data=None):
     global plugin_name, types, config
 
@@ -394,7 +409,7 @@ def wallarm_init():
         'values': Queue.Queue(),
         }
 
-    send_thread = threading.Thread(target=send_loop, args=[config, data])
+    send_thread = threading.Thread(target=send_watchdog, args=[config, data])
     data['sender'] = send_thread
     send_thread.start()
     collectd.register_write(wallarm_write, data=data)
