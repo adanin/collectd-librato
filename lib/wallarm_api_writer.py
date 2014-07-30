@@ -277,13 +277,13 @@ def update_queue_size(myconfig):
 
 def pack_msg(myconfig, send_queue):
     msg = msgpack.packb(send_queue)
-    while len(msg) > config['max_msg_size_bytes']:
-        config['measr_avg_size'] = len(msg) / len(send_queue)
+    while len(msg) > myconfig['max_msg_size_bytes']:
+        myconfig['measr_avg_size'] = len(msg) / len(send_queue)
         update_queue_size(myconfig)
         msg = msgpack.packb(
-            send_queue[:config['send_queue_size']]
+            send_queue[:myconfig['send_queue_size']]
         )
-    send_queue = send_queue[config['send_queue_size']:]
+    send_queue = send_queue[myconfig['send_queue_size']:]
     return msg
 
 

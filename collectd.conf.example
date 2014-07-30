@@ -7,13 +7,11 @@ LoadPlugin python
 <Plugin python>
         ModulePath "./lib/"
         LogTraces true
-        Import "wallarm_msgpack"
+        Import "wallarm_api_writer"
 
-    <Module wallarm_msgpack>
+    <Module wallarm_api_writer>
        APIConnFile "./example_api.yaml"
        # TypesDB "/etc/collectd/my_types.db"
-       # MainQueueMaxLength 200000
-       # SendQueueMaxLength 10000 # not used now
        # FlushIntervalSecs 2
        # FlushTimeoutSecs 10
        # URLPath "/"
