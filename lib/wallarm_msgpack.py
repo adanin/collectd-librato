@@ -38,10 +38,6 @@ types = {}
 config = {
     'url_path': '/',
     'types_db': ['/usr/share/collectd/types.db'],
-    'flush_interval_secs': 2,
-    'send_timeout_secs': 10,
-    'main_queue_max_length': 200000,
-    'send_queue_max_length': 10000,
     'api': {
         'host': 'localhost',
         # 'port' depends on 'use_ssl' value
@@ -53,6 +49,12 @@ config = {
         'http': 80,
         'https': 444,
     },
+    'measr_avg_size': 200,
+    'send_timeout_secs': 10,
+    'flush_interval_secs': 2,
+    'max_msg_size_bytes': 10000,
+    'max_measr_keep_interval_secs': 10,
+    'msg_size_dec_coeff': 0.98,
 }
 
 
@@ -195,7 +197,7 @@ def update_credentials(myconfig):
         myconfig['api_url'] = create_api_url(myconfig)
 
 
-def wallarm_msgpack(cfg_obj):
+def wallarm_api_writer_config(cfg_obj):
     global config
 
     for child in cfg_obj.children:
@@ -309,6 +311,7 @@ def send_loop(myconfig, mydata):
     while True:
         time.sleep(myconfig['flush_interval_secs'])
 
+        # TODO (adanin): Create a shrinker for the main_queue.
         if is_retry:
             if not send_data(myconfig, packed_data):
                 continue
@@ -380,6 +383,7 @@ def wallarm_write(v, data=None):
         "type": v.type,
         "type_instance": v.type_instance
     }
+
     data['values'].put(measurement)
 
 
@@ -415,5 +419,5 @@ def wallarm_init():
     collectd.register_write(wallarm_write, data=data)
 
 
-collectd.register_config(wallarm_msgpack)
+collectd.register_config(wallarm_api_writer_config)
 collectd.register_init(wallarm_init)
