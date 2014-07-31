@@ -272,7 +272,7 @@ def send_data(myconfig, payload):
 
 def update_queue_size(myconfig):
     size = myconfig['max_msg_size_bytes'] / myconfig['measr_avg_size']
-    myconfig['send_queue_size'] = myconfig['msg_size_dec_coeff'] * size
+    myconfig['send_queue_size'] = int(myconfig['msg_size_dec_coeff'] * size)
 
 
 def pack_msg(myconfig, send_queue):
@@ -335,7 +335,7 @@ def send_loop(myconfig, mydata):
 
 
 def send_watchdog(myconfig, mydata):
-    while True
+    while True:
         try:
             send_loop(myconfig, mydata)
         except KeyboardInterrupt:
