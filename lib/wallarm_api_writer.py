@@ -26,6 +26,8 @@ import threading
 import urlparse
 import yaml
 
+from copy import copy
+
 
 # NOTE: This version is grepped from the Makefile, so don't change the
 # format of this line.
@@ -38,13 +40,6 @@ types = {}
 config = {
     'url_path': '/',
     'types_db': ['/usr/share/collectd/types.db'],
-    'api': {
-        'host': 'localhost',
-        # 'port' depends on 'use_ssl' value
-        'ca_path': '/dev/null',
-        'ca_verify': False,
-        'use_ssl': False,
-    },
     'default_ports': {
         'http': 80,
         'https': 444,
@@ -57,6 +52,13 @@ config = {
     'msg_size_dec_coeff': 0.98,
 }
 
+default_api_config = {
+        'host': 'localhost',
+        # 'port' depends on 'use_ssl' value
+        'ca_path': '/dev/null',
+        'ca_verify': False,
+        'use_ssl': False,
+    },
 
 def get_time():
     """
@@ -114,9 +116,11 @@ def get_api_credentials(myconfig):
     """
 
     global plugin_name
+    drop_creds(myconfig)
     try:
         with open(myconfig['api_conn_file']) as fo:
             api_creds = yaml.load(fo)
+            # TODO (adanin): catch yaml.load exception too.
     except IOError as e:
         collectd.error(
             "{0}: Cannot get API configuration from file {1}: {2}".format(
@@ -135,6 +139,7 @@ def get_api_credentials(myconfig):
         collectd.error(msg)
         raise ValueError(msg)
 
+    myconfig['api'] = copy(default_api_config)
     for key in 'uuid', 'secret':
         myconfig['api'][key] = api_creds[key]
 
@@ -179,14 +184,20 @@ def prepare_http_headers(myconfig):
     return headers
 
 
+def drop_creds(myconfig):
+    # We cannot get new credentials from file. So, lets drop it from config
+    myconfig.pop('api', None)
+    myconfig.pop('api_url', None)
+
+
 def is_new_credentials(myconfig):
     try:
-        cur_api_file_mtime = os.stat(myconfig['api_conn_file']).st_mtime
-        if cur_api_file_mtime != myconfig.get('api_file_mtime', 0):
-            myconfig['api_file_mtime'] = cur_api_file_mtime
+        file_mtime = os.stat(myconfig['api_conn_file']).st_mtime
+        if file_mtime != myconfig.get('api_file_mtime', 0):
+            myconfig['api_file_mtime'] = file_mtime
             return True
     except OSError:
-        pass
+        drop_creds(myconfig)
     return False
 
 
@@ -232,8 +243,6 @@ def wallarm_api_writer_config(cfg_obj):
         collectd.error(msg)
         raise ValueError(msg)
 
-    update_credentials(config)
-
 
 def send_data(myconfig, payload):
     """
@@ -242,6 +251,8 @@ def send_data(myconfig, payload):
 
     global plugin_name
     update_credentials(myconfig)
+    if 'api_url' not in myconfig:
+        return
 
     if (myconfig['api']['use_ssl'] and myconfig['api']['ca_verify']
             and myconfig['api']['ca_path']):
