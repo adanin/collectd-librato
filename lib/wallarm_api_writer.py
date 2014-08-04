@@ -36,8 +36,7 @@ plugin_name = 'wallarm_api_writer'
 class WallarmApiWriter(object):
     def __init__(self, plugin_name):
         self.plugin_name = plugin_name
-        self.types = {}
-        # Some default values
+
         self.config = {
             'url_path': '/',
             'types_db': ['/usr/share/collectd/types.db'],
@@ -48,11 +47,13 @@ class WallarmApiWriter(object):
             'measr_avg_size': 50,
             'send_timeout_secs': 10,
             'flush_interval_secs': 2,
+            'sleep_tick_interval_secs': 0.1,
             'max_msg_size_bytes': 7000,
-            'max_measr_keep_interval_secs': 10,
-            'msg_size_dec_coeff': 0.99,
+            'max_store_timeout': 60,
+            'min_send_threshold': 10,
+            'queue_size_decreaser': 5,
             'logging': {
-                'enabled': True,
+                'enabled': False,
                 'filename': '/tmp/wallarm_api_writer.log',
                 'level': 'debug',
             }
@@ -64,8 +65,16 @@ class WallarmApiWriter(object):
                 'ca_verify': False,
                 'use_ssl': False,
             }
-        self.drop_creds()
+
+        self.types = {}
+        self.api_config = {}
+        self.api_url = ''
         self.api_file_mtime = 0
+
+        self.measr_avg_size = None
+        self.last_try_time = 0
+        self.last_flush_time = 0
+
         self.logger = None
 
     def get_time(self):
@@ -76,9 +85,10 @@ class WallarmApiWriter(object):
         return int(time.mktime(time.localtime()))
 
     def setup_logging(self):
-        if ('logging' in self.config and
-                self.config['logging'].get('enabled', None)):
-            logconfig = self.config['logging']
+        if ('logging' not in self.config or
+                not self.config['logging'].get('enabled')):
+            return
+        logconfig = self.config['logging']
         logging.basicConfig(
             filename=logconfig['filename'],
             level=logging.getLevelName(logconfig['level'].upper()))
@@ -98,13 +108,13 @@ class WallarmApiWriter(object):
                 self.config['api_conn_file'] = val
             elif child.key == 'TypesDB':
                 self.config['types_db'] = child.values
-            elif child.key == 'MainQueueMaxLength':
-                self.config['main_queue_max_length'] = int(val)
-            elif child.key == 'SendQueueMaxLength':
-                self.config['send_queue_max_length'] = int(val)
-            elif child.key == 'FlushIntervalSecs':
+            elif child.key == 'MaxRequestSize':
+                self.config['max_msg_size_bytes'] = int(val)
+            elif child.key == 'DropOutdatedTimeout':
+                self.config['max_store_timeout'] = int(val)
+            elif child.key == 'FlushInterval':
                 self.config['flush_interval_secs'] = int(val)
-            elif child.key == 'FlushTimeoutSecs':
+            elif child.key == 'FlushTimeout':
                 self.config['send_timeout_secs'] = int(val)
             elif child.key == 'URLPath':
                 self.config['url_path'] = val
@@ -254,9 +264,12 @@ class WallarmApiWriter(object):
 
     def update_credentials(self):
         if self.is_new_credentials():
-            self.get_api_credentials()
-            self.prepare_http_headers()
-            self.create_api_url()
+            try:
+                self.get_api_credentials()
+                self.prepare_http_headers()
+                self.create_api_url()
+            except ValueError:
+                pass
 
     def wallarm_write(self, value):
         if value.type not in self.types:
@@ -299,77 +312,83 @@ class WallarmApiWriter(object):
     def shutdown_callback(self):
         self.shutdown_event.set()
 
+    def flush_callback(self):
+        self.flush_event.set()
+
     def update_queue_size(self):
-        size = self.config['max_msg_size_bytes'] / self.measr_avg_size
-        self.send_queue_size = int(self.config['msg_size_dec_coeff'] * size)
+        size = int(self.config['max_msg_size_bytes'] / self.measr_avg_size)
+        self.send_queue_size = size - self.config['queue_size_decreaser']
 
+    def get_payload(self):
+        # Fill up send_queue with new messages until full.
+        try:
+            for i in xrange(self.send_queue_size - len(self.send_queue)):
+                self.send_queue.append(self.main_queue.get_nowait())
+                self.main_queue.task_done()
+        except Queue.Empty:
+            pass
+        if self.config['min_send_threshold'] > len(self.send_queue):
+            return '', 0
 
-    def pack_msg(self):
-        if not len(self.send_queue):
-            return ''
-        self.log("info",
-            "Trying to pack queue with {} messages.".format(
-                len(self.send_queue)
-            )
-        )
+        # self.log("info",
+        #     "Trying to pack queue with {} messages.".format(
+        #         len(self.send_queue)
+        #     )
+        # )
+
+        # Pack messages and try to fit into limit.
         msg = msgpack.packb(self.send_queue)
         msg_len = len(self.send_queue)
-        if len(msg) > self.config['max_msg_size_bytes']:
+        while len(msg) > self.config['max_msg_size_bytes']:
             self.measr_avg_size = len(msg) / len(self.send_queue)
             self.update_queue_size()
             msg = msgpack.packb(
                 self.send_queue[:self.send_queue_size]
             )
             msg_len = self.send_queue_size
-        self.send_queue[:self.send_queue_size] = ()
-        self.log(
-            "info",
-            "Packed {} messages with total size {} bytes. {} messages in"
-            " the send_queue left.".format(msg_len, len(msg),
-                                           len(self.send_queue))
-        )
-        return msg
+        # self.log(
+        #     "info",
+        #     "Packed {} messages with total size {} bytes. {} messages in"
+        #     " the send_queue left.".format(msg_len, len(msg),
+        #                                    len(self.send_queue))
+        # )
+        return msg, msg_len
+
+    def drop_old_messages(self):
+        if not len(self.send_queue):
+            return
+        time_delta = self.get_time() - self.send_queue[-1]['time']
+        if time_delta > self.config['max_store_timeout']:
+            self.log(
+                'info',
+                "{0}: Drop {1} outdated messages from queue".format(
+                    self.plugin_name,
+                    len(self.send_queue),
+                )
+            )
+            self.send_queue[:] = ()
 
     def send_loop(self):
-        self.update_queue_size()
-        self.packed_data = None
-        self.is_retry = False
-        self.last_flush_time = self.get_time()
+        # Drop outdated messages from send_queue.
+        self.drop_old_messages()
 
-        # TODO (adanin): Create a shrinker for the main_queue.
-        if self.is_retry:
-            if self.send_data():
-                self.is_retry = False
+        payload, msg_len = self.get_payload()
 
-        while not self.main_queue.empty() or len(self.send_queue):
-            try:
-                for i in xrange(self.send_queue_size - len(self.send_queue)):
-                    self.send_queue.append(self.main_queue.get_nowait())
-                    self.main_queue.task_done()
-            except Queue.Empty:
-                pass
+        self.update_credentials()
+        if not self.api_url:
+            return
 
-            # Pack send_queue but try to fit into max message size.
-            self.packed_data = self.pack_msg()
-            if not self.send_data():
-                self.is_retry = True
+        while payload:
+            if not self.send_data(payload):
                 return
-
-            # TODO(adanin): This is not flush_time, but the time we pass with
-            # empty main queue.
+            self.send_queue[:msg_len] = ()
             self.last_flush_time = self.get_time()
+            payload, msg_len = self.get_payload()
 
-    def send_data(self):
+    def send_data(self, payload):
         """
         POST a collection of metrics to the API.
         """
-
-        if not self.packed_data:
-            return True
-        self.update_credentials()
-        if not self.api_url:
-            return False
-
         if (self.api_config['use_ssl'] and self.api_config['ca_verify']
                 and self.api_config['ca_path']):
             verify = self.api_config['ca_path']
@@ -380,7 +399,7 @@ class WallarmApiWriter(object):
             req = requests.post(
                 self.api_url,
                 verify=verify,
-                data=self.packed_data,
+                data=payload,
                 headers=self.http_headers,
                 timeout=self.config['send_timeout_secs'],
             )
@@ -388,6 +407,7 @@ class WallarmApiWriter(object):
                 raise requests.exceptions.HTTPError(
                     'HTTP status in response is: {}'.format(req.status_code)
                 )
+
         except requests.exceptions.RequestException as e:
             self.log(
                 'warning',
@@ -400,18 +420,29 @@ class WallarmApiWriter(object):
         return True
 
     def send_watchdog(self):
-        while not self.shutdown_event.is_set():
+        last_repeat = False
+        while not last_repeat:
+            time.sleep(self.config['sleep_tick_interval_secs'])
+
+            if self.shutdown_event.is_set():
+                last_repeat = True
+                self.flush_event.set()
+
+            time_delta = self.get_time() - self.last_try_time
+            if (time_delta < self.config['flush_interval_secs'] and
+                    not self.flush_event.is_set()):
+                continue
+
             try:
                 self.send_loop()
-            except KeyboardInterrupt:
-                return
             except Exception as e:
                 msg = "{0}: Sender failed and will be restarted: {1}".format(
                     self.plugin_name,
                     traceback.format_exc()
                 )
                 self.log('error', msg)
-            time.sleep(self.config['flush_interval_secs'])
+            self.last_try_time = self.get_time()
+            self.flush_event.clear()
 
     def wallarm_init(self):
         for typedb_file in self.config['types_db']:
@@ -435,17 +466,22 @@ class WallarmApiWriter(object):
             self.log('error', msg)
             raise ValueError(msg)
 
+        self.last_try_time = self.get_time()
         self.last_flush_time = self.get_time()
         self.main_queue = Queue.Queue()
         self.send_queue = []
         self.measr_avg_size = self.config['measr_avg_size']
+        self.update_queue_size()
         self.shutdown_event = threading.Event()
-
+        self.flush_event = threading.Event()
 
         self.send_thread = threading.Thread(target=self.send_watchdog)
         self.send_thread.start()
+
         collectd.register_write(self.wallarm_write)
         collectd.register_shutdown(self.shutdown_callback)
+        collectd.register_flush(self.flush_callback)
+
 
 plugin = WallarmApiWriter(plugin_name)
 collectd.register_config(plugin.wallarm_api_writer_config)

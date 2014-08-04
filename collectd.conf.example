@@ -19,14 +19,21 @@ LoadPlugin python
 
 <Plugin python>
         ModulePath "./lib/"
+        ModulePath "/usr/lib/collectd/python/"
         LogTraces true
         Import "wallarm_api_writer"
 
     <Module wallarm_api_writer>
        APIConnFile "./example_api.yaml"
        # TypesDB "/etc/collectd/my_types.db"
-       # FlushIntervalSecs 2
-       # FlushTimeoutSecs 10
+       ## The time (secs) between send message attempts.
+       # FlushInterval 2
+       ## The timeout (secs) for HTTP request.
+       # FlushTimeout 10
+       ## The max size of HTTP body in bytes.
+       # MaxRequestSize 1000000
+       ## The timeout (secs) for keeping old messages in queue.
+       # DropOutdatedTimeout 1800
        # URLPath "/"
     </Module>
 </Plugin>
