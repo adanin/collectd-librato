@@ -17,12 +17,14 @@
 #
 
 import collectd
+import logging
 import msgpack
 import os
 import Queue
 import requests
 import time
 import threading
+import traceback
 import urlparse
 import yaml
 
@@ -50,6 +52,10 @@ config = {
     'max_msg_size_bytes': 10000,
     'max_measr_keep_interval_secs': 10,
     'msg_size_dec_coeff': 0.98,
+    'logging': {
+        'filename': '/tmp/wallarm_api_writer.log',
+        'level': 'debug',
+    }
 }
 
 default_api_config = {
@@ -58,7 +64,25 @@ default_api_config = {
         'ca_path': '/dev/null',
         'ca_verify': False,
         'use_ssl': False,
-    },
+    }
+
+logger = None
+
+def setup_logging(myconfig):
+    global logger
+    if 'logging' in myconfig:
+        logconfig = myconfig['logging']
+    logging.basicConfig(
+        filename=logconfig['filename'],
+        level=logging.getLevelName(logconfig['level'].upper()))
+    logger = logging.getLogger()
+
+
+def log(level, msg):
+    if logger:
+        getattr(logger, level)(msg)
+    getattr(collectd, level)(msg)
+
 
 def get_time():
     """
@@ -92,7 +116,8 @@ def wallarm_parse_types_file(path):
                 ds_fields = ds.split(':')
 
                 if len(ds_fields) != 4:
-                    collectd.warning(
+                    log(
+                        'warning',
                         '{0}: cannot parse data source {1} on type {2}'.format(
                             plugin_name,
                             ds,
@@ -122,7 +147,8 @@ def get_api_credentials(myconfig):
             api_creds = yaml.load(fo)
             # TODO (adanin): catch yaml.load exception too.
     except IOError as e:
-        collectd.error(
+        log(
+            'error',
             "{0}: Cannot get API configuration from file {1}: {2}".format(
                 plugin_name,
                 myconfig['api_conn_file'],
@@ -136,7 +162,7 @@ def get_api_credentials(myconfig):
             "{0}: There is no 'secret' or 'uuid' fields"
             " in API configuration file".format(plugin_name)
         )
-        collectd.error(msg)
+        log('error',msg)
         raise ValueError(msg)
 
     myconfig['api'] = copy(default_api_config)
@@ -217,7 +243,7 @@ def wallarm_api_writer_config(cfg_obj):
         if child.key == 'APIConnFile':
             config['api_conn_file'] = val
         elif child.key == 'TypesDB':
-            config['types_db'] = val
+            config['types_db'] = child.values
         elif child.key == 'MainQueueMaxLength':
             config['main_queue_max_length'] = int(val)
         elif child.key == 'SendQueueMaxLength':
@@ -229,19 +255,24 @@ def wallarm_api_writer_config(cfg_obj):
         elif child.key == 'URLPath':
             config['url_path'] = val
         else:
-            collectd.warning(
+            log(
+                'warning',
                 '{0}: Unknown config key: {1}.'.format(
                     plugin_name,
                     child.key
                 )
             )
 
+    setup_logging(config)
+
     if 'api_conn_file' not in config:
         msg = '{0}: No file with an API configuration provided'.format(
             plugin_name
         )
-        collectd.error(msg)
+        log('error', msg)
         raise ValueError(msg)
+
+    log("info", "Got config: {}".format(config))
 
 
 def send_data(myconfig, payload):
@@ -252,7 +283,7 @@ def send_data(myconfig, payload):
     global plugin_name
     update_credentials(myconfig)
     if 'api_url' not in myconfig:
-        return
+        return False
 
     if (myconfig['api']['use_ssl'] and myconfig['api']['ca_verify']
             and myconfig['api']['ca_path']):
@@ -268,13 +299,16 @@ def send_data(myconfig, payload):
             headers=config['http_headers'],
             timeout=config['send_timeout_secs'],
         )
-        req.close()
-        req.raise_for_status()
+        if req.status_code not in (200,):
+            raise requests.exceptions.HTTPError(
+                'HTTP status in response is: {}'.format(req.status_code)
+            )
     except requests.exceptions.RequestException as e:
-        collectd.warning(
+        log(
+            'warning',
             "{0}: Cannot send data to the API: {1}".format(
                 plugin_name,
-                str(e),
+                traceback.format_exc(),
             )
         )
         return False
@@ -294,7 +328,7 @@ def pack_msg(myconfig, send_queue):
         msg = msgpack.packb(
             send_queue[:myconfig['send_queue_size']]
         )
-    send_queue = send_queue[myconfig['send_queue_size']:]
+    send_queue[:myconfig['send_queue_size']] = ()
     return msg
 
 
@@ -319,7 +353,7 @@ def send_loop(myconfig, mydata):
     is_retry = False
     mydata['last_flush_time'] = get_time()
 
-    while True:
+    while not mydata['shutdown'].is_set():
         time.sleep(myconfig['flush_interval_secs'])
 
         # TODO (adanin): Create a shrinker for the main_queue.
@@ -328,7 +362,7 @@ def send_loop(myconfig, mydata):
                 continue
             is_retry = False
 
-        while not (empty_main_queue and len(send_queue)) or not is_retry:
+        while not ((empty_main_queue and not len(send_queue)) or is_retry):
             # Fill up internal send_queue.
             try:
                 for i in xrange(myconfig['send_queue_size'] - len(send_queue)):
@@ -342,11 +376,12 @@ def send_loop(myconfig, mydata):
             if not send_data(myconfig, packed_data):
                 is_retry = True
                 continue
+
             mydata['last_flush_time'] = get_time()
 
 
 def send_watchdog(myconfig, mydata):
-    while True:
+    while not mydata['shutdown'].is_set():
         try:
             send_loop(myconfig, mydata)
         except KeyboardInterrupt:
@@ -354,16 +389,24 @@ def send_watchdog(myconfig, mydata):
         except Exception as e:
             msg = "{0}: Sender failed and will be restarted: {1}".format(
                 plugin_name,
-                str(e)
+                traceback.format_exc()
             )
-            collectd.error(msg)
+            log('error', msg)
+        time.sleep(myconfig['flush_interval_secs'])
+
+
+def shutdown_wrapper(mydata):
+    def shutdown():
+        mydata['shutdown'].set()
+    return shutdown
 
 
 def wallarm_write(v, data=None):
     global plugin_name, types, config
 
     if v.type not in types:
-        collectd.warning(
+        log(
+            'warning',
             '{0}: do not know how to handle type {1}. Do you have'
             ' all your types.db files configured?'.format(
                 plugin_name,
@@ -375,7 +418,8 @@ def wallarm_write(v, data=None):
     v_type = types[v.type]
 
     if len(v_type[0]) != len(v.values):
-        collectd.warning(
+        log(
+            'warning',
             '{0}: differing number of values for type {1}'.format(
                 plugin_name,
                 v.type,
@@ -409,25 +453,27 @@ def wallarm_init():
                 typedb_file,
                 str(e)
             )
-            collectd.warning(msg)
+            log('warning', msg)
 
     if not len(types):
         msg = "{0}: Didn't find any valid type in TypesDB files: {1}".format(
             plugin_name,
             config['types_db'],
         )
-        collectd.error(msg)
+        log('error', msg)
         raise ValueError(msg)
 
     data = {
         'last_flush_time': get_time(),
         'values': Queue.Queue(),
+        'shutdown': threading.Event(),
         }
 
     send_thread = threading.Thread(target=send_watchdog, args=[config, data])
     data['sender'] = send_thread
     send_thread.start()
     collectd.register_write(wallarm_write, data=data)
+    collectd.register_shutdown(shutdown_wrapper(data))
 
 
 collectd.register_config(wallarm_api_writer_config)
