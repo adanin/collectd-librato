@@ -49,7 +49,7 @@ config = {
     'measr_avg_size': 200,
     'send_timeout_secs': 10,
     'flush_interval_secs': 2,
-    'max_msg_size_bytes': 10000,
+    'max_msg_size_bytes': 6000,
     'max_measr_keep_interval_secs': 10,
     'msg_size_dec_coeff': 0.98,
     'logging': {
@@ -281,6 +281,8 @@ def send_data(myconfig, payload):
     """
 
     global plugin_name
+    if not payload:
+        return True
     update_credentials(myconfig)
     if 'api_url' not in myconfig:
         return False
@@ -321,14 +323,26 @@ def update_queue_size(myconfig):
 
 
 def pack_msg(myconfig, send_queue):
+    if not len(send_queue):
+        return ''
+    log("info",
+        "Trying to pack queue with {} messages.".format(len(send_queue))
+    )
     msg = msgpack.packb(send_queue)
-    while len(msg) > myconfig['max_msg_size_bytes']:
+    msg_len = len(send_queue)
+    if len(msg) > myconfig['max_msg_size_bytes']:
         myconfig['measr_avg_size'] = len(msg) / len(send_queue)
         update_queue_size(myconfig)
         msg = msgpack.packb(
             send_queue[:myconfig['send_queue_size']]
         )
+        msg_len = myconfig['send_queue_size']
     send_queue[:myconfig['send_queue_size']] = ()
+    log(
+        "info",
+        "Packed {} messages with total size {} bytes. {} messages in"
+        " the send_queue left.".format(msg_len, len(msg), len(send_queue))
+    )
     return msg
 
 
@@ -349,7 +363,6 @@ def send_loop(myconfig, mydata):
     main_queue = mydata['values']
     send_queue = []
     packed_data = None
-    empty_main_queue = False
     is_retry = False
     mydata['last_flush_time'] = get_time()
 
@@ -362,6 +375,7 @@ def send_loop(myconfig, mydata):
                 continue
             is_retry = False
 
+        empty_main_queue = main_queue.empty()
         while not ((empty_main_queue and not len(send_queue)) or is_retry):
             # Fill up internal send_queue.
             try:
@@ -377,6 +391,8 @@ def send_loop(myconfig, mydata):
                 is_retry = True
                 continue
 
+            # TODO(adanin): This is not flush_time, but the time we pass with
+            # empty main queue.
             mydata['last_flush_time'] = get_time()
 
 
