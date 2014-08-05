@@ -30,8 +30,8 @@ from copy import copy
 # NOTE: This version is grepped from the Makefile, so don't change the
 # format of this line.
 version = "0.0.2"
-
 plugin_name = 'wallarm_api_writer'
+
 
 class WallarmApiWriter(object):
     def __init__(self, plugin_name):
@@ -59,12 +59,12 @@ class WallarmApiWriter(object):
             }
         }
         self.default_api_config = {
-                'host': 'localhost',
-                # 'port' depends on 'use_ssl' value
-                'ca_path': '/dev/null',
-                'ca_verify': False,
-                'use_ssl': False,
-            }
+            'host': 'localhost',
+            # 'port' depends on 'use_ssl' value
+            'ca_path': '/dev/null',
+            'ca_verify': False,
+            'use_ssl': False,
+        }
 
         self.types = {}
         self.api_config = {}
@@ -209,7 +209,7 @@ class WallarmApiWriter(object):
                 "{0}: There is no 'secret' or 'uuid' fields"
                 " in API configuration file".format(self.plugin_name)
             )
-            self.log('error',msg)
+            self.log('error', msg)
             raise ValueError(msg)
 
         self.api_config = copy(self.default_api_config)
@@ -310,10 +310,24 @@ class WallarmApiWriter(object):
         self.main_queue.put(measurement)
 
     def shutdown_callback(self):
+        # If send_thread is sending now, wait until finished and exit.
+        if self.send_lock.locked():
+            self.send_lock.acquire()
+            self.shutdown_event.set()
+            self.send_lock.release()
+            return
+        # Otherwise send data manually.
+        self.send_lock.acquire()
         self.shutdown_event.set()
-
-    def flush_callback(self):
-        self.flush_event.set()
+        try:
+            self.send_loop()
+        except Exception:
+            msg = "{0}: Flushing queue before shutdown failed: {1}".format(
+                self.plugin_name,
+                traceback.format_exc()
+            )
+            self.log('error', msg)
+        self.send_lock.release()
 
     def update_queue_size(self):
         size = int(self.config['max_msg_size_bytes'] / self.measr_avg_size)
@@ -408,7 +422,7 @@ class WallarmApiWriter(object):
                     'HTTP status in response is: {}'.format(req.status_code)
                 )
 
-        except requests.exceptions.RequestException as e:
+        except requests.exceptions.RequestException:
             self.log(
                 'warning',
                 "{0}: Cannot send data to the API: {1}".format(
@@ -420,29 +434,29 @@ class WallarmApiWriter(object):
         return True
 
     def send_watchdog(self):
-        last_repeat = False
-        while not last_repeat:
+        while not self.shutdown_event.is_set():
             time.sleep(self.config['sleep_tick_interval_secs'])
 
-            if self.shutdown_event.is_set():
-                last_repeat = True
-                self.flush_event.set()
-
             time_delta = self.get_time() - self.last_try_time
-            if (time_delta < self.config['flush_interval_secs'] and
-                    not self.flush_event.is_set()):
+            if time_delta < self.config['flush_interval_secs']:
                 continue
+
+            self.send_lock.acquire()
+            # If there was a send operation by shutdown_callback, do nothing.
+            if self.shutdown_event.is_set():
+                self.send_lock.release()
+                return
 
             try:
                 self.send_loop()
-            except Exception as e:
+            except Exception:
                 msg = "{0}: Sender failed and will be restarted: {1}".format(
                     self.plugin_name,
                     traceback.format_exc()
                 )
                 self.log('error', msg)
+            self.send_lock.release()
             self.last_try_time = self.get_time()
-            self.flush_event.clear()
 
     def wallarm_init(self):
         for typedb_file in self.config['types_db']:
@@ -473,14 +487,13 @@ class WallarmApiWriter(object):
         self.measr_avg_size = self.config['measr_avg_size']
         self.update_queue_size()
         self.shutdown_event = threading.Event()
-        self.flush_event = threading.Event()
+        self.send_lock = threading.Lock()
 
         self.send_thread = threading.Thread(target=self.send_watchdog)
         self.send_thread.start()
 
         collectd.register_write(self.wallarm_write)
         collectd.register_shutdown(self.shutdown_callback)
-        collectd.register_flush(self.flush_callback)
 
 
 plugin = WallarmApiWriter(plugin_name)
